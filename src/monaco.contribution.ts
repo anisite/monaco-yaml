@@ -1,72 +1,82 @@
-import { Emitter, languages } from 'monaco-editor/esm/vs/editor/editor.api';
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+'use strict';
 
 import { setupMode } from './yamlMode';
 
+import Emitter = monaco.Emitter;
+import IEvent = monaco.IEvent;
+
+declare var require: <T>(
+  moduleId: [string],
+  callback: (module: T) => void
+) => void;
+
 // --- YAML configuration and defaults ---------
 
-export function createLanguageServiceDefaults(
-  languageId: string,
-  initialDiagnosticsOptions: languages.yaml.DiagnosticsOptions,
-): languages.yaml.LanguageServiceDefaults {
-  const onDidChange = new Emitter<languages.yaml.LanguageServiceDefaults>();
-  let diagnosticsOptions = initialDiagnosticsOptions;
+export class LanguageServiceDefaultsImpl
+  implements monaco.languages.yaml.LanguageServiceDefaults {
+  private _onDidChange = new Emitter<
+    monaco.languages.yaml.LanguageServiceDefaults
+  >();
+  private _diagnosticsOptions: monaco.languages.yaml.DiagnosticsOptions;
+  private _languageId: string;
 
-  const languageServiceDefaults: languages.yaml.LanguageServiceDefaults = {
-    get onDidChange() {
-      return onDidChange.event;
-    },
+  constructor(
+    languageId: string,
+    diagnosticsOptions: monaco.languages.yaml.DiagnosticsOptions
+  ) {
+    this._languageId = languageId;
+    this.setDiagnosticsOptions(diagnosticsOptions);
+  }
 
-    get languageId() {
-      return languageId;
-    },
+  get onDidChange(): IEvent<monaco.languages.yaml.LanguageServiceDefaults> {
+    return this._onDidChange.event;
+  }
 
-    get diagnosticsOptions() {
-      return diagnosticsOptions;
-    },
+  get languageId(): string {
+    return this._languageId;
+  }
 
-    setDiagnosticsOptions(options) {
-      diagnosticsOptions = options || {};
-      onDidChange.fire(languageServiceDefaults);
-    },
-  };
+  get diagnosticsOptions(): monaco.languages.yaml.DiagnosticsOptions {
+    return this._diagnosticsOptions;
+  }
 
-  return languageServiceDefaults;
+  public setDiagnosticsOptions(
+    options: monaco.languages.yaml.DiagnosticsOptions
+  ): void {
+    this._diagnosticsOptions = options || Object.create(null);
+    this._onDidChange.fire(this);
+  }
 }
 
-const diagnosticDefault: languages.yaml.DiagnosticsOptions = {
+const diagnosticDefault: monaco.languages.yaml.DiagnosticsOptions = {
   validate: true,
   schemas: [],
   enableSchemaRequest: false,
 };
 
-const yamlDefaults = createLanguageServiceDefaults('yaml', diagnosticDefault);
+const yamlDefaults = new LanguageServiceDefaultsImpl('yaml', diagnosticDefault);
 
 // Export API
-function createAPI(): typeof languages.yaml {
+function createAPI(): typeof monaco.languages.yaml {
   return {
     yamlDefaults,
   };
 }
-languages.yaml = createAPI();
+monaco.languages.yaml = createAPI();
 
 // --- Registration to monaco editor ---
 
-languages.register({
+monaco.languages.register({
   id: 'yaml',
   extensions: ['.yaml', '.yml'],
   aliases: ['YAML', 'yaml', 'YML', 'yml'],
   mimetypes: ['application/x-yaml'],
 });
 
-languages.onLanguage('yaml', () => {
+monaco.languages.onLanguage('yaml', () => {
   setupMode(yamlDefaults);
 });
-
-/**
- * Configure `monaco-yaml` diagnostics options.
- *
- * @param options - The options to set.
- */
-export function setDiagnosticsOptions(options: languages.yaml.DiagnosticsOptions = {}): void {
-  languages.yaml.yamlDefaults.setDiagnosticsOptions(options);
-}

@@ -1,107 +1,127 @@
-import { worker } from 'monaco-editor/esm/vs/editor/editor.api';
-import { Promisable } from 'type-fest';
-import { TextDocument } from 'vscode-languageserver-textdocument';
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Red Hat, Inc. All rights reserved.
+ *  Copyright (c) Adam Voss. All rights reserved.
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+'use strict';
+
+import Thenable = monaco.Thenable;
+import IWorkerContext = monaco.worker.IWorkerContext;
+
 import * as ls from 'vscode-languageserver-types';
-import {
-  CustomFormatterOptions,
-  getLanguageService,
-  LanguageSettings,
-} from 'yaml-language-server/lib/esm/languageservice/yamlLanguageService';
+import * as yamlService from 'yaml-language-server';
 
-let defaultSchemaRequestService: (url: string) => Promise<string>;
-
+let defaultSchemaRequestService;
 if (typeof fetch !== 'undefined') {
-  defaultSchemaRequestService = (url) => fetch(url).then((response) => response.text());
+  defaultSchemaRequestService = function (url) {
+    return fetch(url).then((response) => response.text());
+  };
 }
 
-export interface YAMLWorker {
-  doValidation: (uri: string) => Promisable<ls.Diagnostic[]>;
+export class YAMLWorker {
+  private _ctx: IWorkerContext;
+  private _languageService: yamlService.LanguageService;
+  private _languageSettings: yamlService.LanguageSettings;
+  private _languageId: string;
+  private _isKubernetes: boolean;
 
-  doComplete: (uri: string, position: ls.Position) => Promisable<ls.CompletionList>;
+  constructor(ctx: IWorkerContext, createData: ICreateData) {
+    const prefix = createData.prefix || '';
+    const service = (url: string) =>
+      defaultSchemaRequestService(`${prefix}${url}`);
+    this._ctx = ctx;
+    this._languageSettings = createData.languageSettings;
+    this._languageId = createData.languageId;
+    this._languageService = yamlService.getLanguageService(
+      createData.enableSchemaRequest && service,
+      null,
+      []
+    );
+    this._isKubernetes = createData.isKubernetes || false;
+    this._languageService.configure({
+      ...this._languageSettings,
+      hover: true,
+      isKubernetes: this._isKubernetes,
+    });
+  }
 
-  doHover: (uri: string, position: ls.Position) => Promisable<ls.Hover>;
+  public doValidation(uri: string): Thenable<ls.Diagnostic[]> {
+    const document = this._getTextDocument(uri);
+    if (document) {
+      return this._languageService.doValidation(document, this._isKubernetes);
+    }
+    return Promise.resolve([]);
+  }
 
-  format: (uri: string, options: CustomFormatterOptions) => Promisable<ls.TextEdit[]>;
+  public doComplete(
+    uri: string,
+    position: ls.Position
+  ): Thenable<ls.CompletionList> {
+    const document = this._getTextDocument(uri);
+    return this._languageService.doComplete(
+      document,
+      position,
+      this._isKubernetes
+    );
+  }
 
-  resetSchema: (uri: string) => Promisable<boolean>;
+  public doResolve(item: ls.CompletionItem): Thenable<ls.CompletionItem> {
+    return this._languageService.doResolve(item);
+  }
 
-  findDocumentSymbols: (uri: string) => Promisable<ls.DocumentSymbol[]>;
+  public doHover(uri: string, position: ls.Position): Thenable<ls.Hover> {
+    const document = this._getTextDocument(uri);
+    return this._languageService.doHover(document, position);
+  }
 
-  findLinks: (uri: string) => Promisable<ls.DocumentLink[]>;
-}
+  public format(
+    uri: string,
+    range: ls.Range,
+    options: yamlService.CustomFormatterOptions
+  ): Thenable<ls.TextEdit[]> {
+    const document = this._getTextDocument(uri);
+    const textEdits = this._languageService.doFormat(document, options);
+    return Promise.resolve(textEdits);
+  }
 
-export function createYAMLWorker(
-  ctx: worker.IWorkerContext,
-  {
-    enableSchemaRequest,
-    isKubernetes = false,
-    languageId,
-    languageSettings,
-    prefix = '',
-  }: ICreateData,
-): YAMLWorker {
-  const service = (url: string): Promise<string> => defaultSchemaRequestService(`${prefix}${url}`);
-  const languageService = getLanguageService(enableSchemaRequest && service, null, null, null);
-  languageService.configure({
-    ...languageSettings,
-    hover: true,
-    isKubernetes,
-  });
+  public resetSchema(uri: string): Thenable<boolean> {
+    return Promise.resolve(this._languageService.resetSchema(uri));
+  }
 
-  const getTextDocument = (uri: string): TextDocument => {
-    const models = ctx.getMirrorModels();
+  public findDocumentSymbols(uri: string): Thenable<ls.DocumentSymbol[]> {
+    const document = this._getTextDocument(uri);
+    const symbols = this._languageService.findDocumentSymbols2(document);
+    return Promise.resolve(symbols);
+  }
+
+  private _getTextDocument(uri: string): ls.TextDocument {
+    const models = this._ctx.getMirrorModels();
     for (const model of models) {
-      if (String(model.uri) === uri) {
-        return TextDocument.create(uri, languageId, model.version, model.getValue());
+      if (model.uri.toString() === uri) {
+        return ls.TextDocument.create(
+          uri,
+          this._languageId,
+          model.version,
+          model.getValue()
+        );
       }
     }
     return null;
-  };
-
-  return {
-    doValidation(uri) {
-      const document = getTextDocument(uri);
-      if (document) {
-        return languageService.doValidation(document, isKubernetes);
-      }
-      return [];
-    },
-
-    doComplete(uri, position) {
-      const document = getTextDocument(uri);
-      return languageService.doComplete(document, position, isKubernetes);
-    },
-
-    doHover(uri, position) {
-      const document = getTextDocument(uri);
-      return languageService.doHover(document, position);
-    },
-
-    format(uri, options) {
-      const document = getTextDocument(uri);
-      return languageService.doFormat(document, options);
-    },
-
-    resetSchema(uri) {
-      return languageService.resetSchema(uri);
-    },
-
-    findDocumentSymbols(uri) {
-      const document = getTextDocument(uri);
-      return languageService.findDocumentSymbols2(document, {});
-    },
-
-    findLinks(uri) {
-      const document = getTextDocument(uri);
-      return Promise.resolve(languageService.findLinks(document));
-    },
-  };
+  }
 }
 
 export interface ICreateData {
   languageId: string;
-  languageSettings: LanguageSettings;
+  languageSettings: yamlService.LanguageSettings;
   enableSchemaRequest: boolean;
   prefix?: string;
   isKubernetes?: boolean;
+}
+
+export function create(
+  ctx: IWorkerContext,
+  createData: ICreateData
+): YAMLWorker {
+  return new YAMLWorker(ctx, createData);
 }

@@ -1,38 +1,149 @@
-import {
-  editor,
-  IDisposable,
-  IMarkdownString,
-  languages,
-  MarkerSeverity,
-  Position,
-  Range,
-  Uri,
-} from 'monaco-editor/esm/vs/editor/editor.api';
-import * as ls from 'vscode-languageserver-types';
-import { CustomFormatterOptions } from 'yaml-language-server/lib/esm/languageservice/yamlLanguageService';
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+'use strict';
 
+import { LanguageServiceDefaultsImpl } from './monaco.contribution';
 import { YAMLWorker } from './yamlWorker';
 
-export type WorkerAccessor = (...more: Uri[]) => PromiseLike<YAMLWorker>;
+import * as ls from 'vscode-languageserver-types';
+
+import Uri = monaco.Uri;
+import Position = monaco.Position;
+import Range = monaco.Range;
+import IRange = monaco.IRange;
+import Thenable = monaco.Thenable;
+import CancellationToken = monaco.CancellationToken;
+import IDisposable = monaco.IDisposable;
+import { CustomFormatterOptions } from 'yaml-language-server';
+
+export type WorkerAccessor = (...more: Uri[]) => Thenable<YAMLWorker>;
 
 // --- diagnostics --- ---
 
-function toSeverity(lsSeverity: ls.DiagnosticSeverity): MarkerSeverity {
-  switch (lsSeverity) {
-    case ls.DiagnosticSeverity.Error:
-      return MarkerSeverity.Error;
-    case ls.DiagnosticSeverity.Warning:
-      return MarkerSeverity.Warning;
-    case ls.DiagnosticSeverity.Information:
-      return MarkerSeverity.Info;
-    case ls.DiagnosticSeverity.Hint:
-      return MarkerSeverity.Hint;
-    default:
-      return MarkerSeverity.Info;
+export class DiagnosticsAdapter {
+  private _disposables: IDisposable[] = [];
+  private _listener: { [uri: string]: IDisposable } = Object.create(null);
+
+  constructor(
+    private _languageId: string,
+    private _worker: WorkerAccessor,
+    defaults: LanguageServiceDefaultsImpl
+  ) {
+    const onModelAdd = (model: monaco.editor.IModel): void => {
+      const modeId = model.getModeId();
+      if (modeId !== this._languageId) {
+        return;
+      }
+
+      let handle: number;
+      this._listener[model.uri.toString()] = model.onDidChangeContent(() => {
+        clearTimeout(handle);
+        handle = setTimeout(() => this._doValidate(model.uri, modeId), 500);
+      });
+
+      this._doValidate(model.uri, modeId);
+    };
+
+    const onModelRemoved = (model: monaco.editor.IModel): void => {
+      monaco.editor.setModelMarkers(model, this._languageId, []);
+      const uriStr = model.uri.toString();
+      const listener = this._listener[uriStr];
+      if (listener) {
+        listener.dispose();
+        delete this._listener[uriStr];
+      }
+    };
+
+    this._disposables.push(monaco.editor.onDidCreateModel(onModelAdd));
+    this._disposables.push(
+      monaco.editor.onWillDisposeModel((model) => {
+        onModelRemoved(model);
+        this._resetSchema(model.uri);
+      })
+    );
+    this._disposables.push(
+      monaco.editor.onDidChangeModelLanguage((event) => {
+        onModelRemoved(event.model);
+        onModelAdd(event.model);
+        this._resetSchema(event.model.uri);
+      })
+    );
+
+    this._disposables.push(
+      defaults.onDidChange((_) => {
+        monaco.editor.getModels().forEach((model) => {
+          if (model.getModeId() === this._languageId) {
+            onModelRemoved(model);
+            onModelAdd(model);
+          }
+        });
+      })
+    );
+
+    this._disposables.push({
+      dispose: () => {
+        monaco.editor.getModels().forEach(onModelRemoved);
+        for (const key in this._listener) {
+          this._listener[key].dispose();
+        }
+      },
+    });
+
+    monaco.editor.getModels().forEach(onModelAdd);
+  }
+
+  public dispose(): void {
+    this._disposables.forEach((d) => d && d.dispose());
+    this._disposables = [];
+  }
+
+  private _resetSchema(resource: Uri): void {
+    this._worker().then((worker) => {
+      worker.resetSchema(resource.toString());
+    });
+  }
+
+  private _doValidate(resource: Uri, languageId: string): void {
+    this._worker(resource)
+      .then((worker) => {
+        return worker.doValidation(resource.toString()).then((diagnostics) => {
+          const markers = diagnostics.map((d) => toDiagnostics(resource, d));
+          const model = monaco.editor.getModel(resource);
+          if (model.getModeId() === languageId) {
+            monaco.editor.setModelMarkers(model, languageId, markers);
+          }
+        });
+      })
+      .then(undefined, (err) => {
+        console.error(err);
+      });
   }
 }
 
-function toDiagnostics(diag: ls.Diagnostic): editor.IMarkerData {
+function toSeverity(lsSeverity: number): monaco.MarkerSeverity {
+  switch (lsSeverity) {
+    case ls.DiagnosticSeverity.Error:
+      return monaco.MarkerSeverity.Error;
+    case ls.DiagnosticSeverity.Warning:
+      return monaco.MarkerSeverity.Warning;
+    case ls.DiagnosticSeverity.Information:
+      return monaco.MarkerSeverity.Info;
+    case ls.DiagnosticSeverity.Hint:
+      return monaco.MarkerSeverity.Hint;
+    default:
+      return monaco.MarkerSeverity.Info;
+  }
+}
+
+function toDiagnostics(
+  resource: Uri,
+  diag: ls.Diagnostic
+): monaco.editor.IMarkerData {
+  const code =
+    typeof diag.code === 'number' ? String(diag.code) : (diag.code as string);
+
   return {
     severity: toSeverity(diag.severity),
     startLineNumber: diag.range.start.line + 1,
@@ -40,110 +151,48 @@ function toDiagnostics(diag: ls.Diagnostic): editor.IMarkerData {
     endLineNumber: diag.range.end.line + 1,
     endColumn: diag.range.end.character + 1,
     message: diag.message,
-    code: String(diag.code),
+    code,
     source: diag.source,
   };
-}
-
-export function createDiagnosticsAdapter(
-  languageId: string,
-  getWorker: WorkerAccessor,
-  defaults: languages.yaml.LanguageServiceDefaults,
-): void {
-  const listeners = new Map<string, IDisposable>();
-
-  const resetSchema = async (resource: Uri): Promise<void> => {
-    const worker = await getWorker();
-    worker.resetSchema(String(resource));
-  };
-
-  const doValidate = async (resource: Uri, languageId: string): Promise<void> => {
-    const worker = await getWorker(resource);
-    const diagnostics = await worker.doValidation(String(resource));
-    const markers = diagnostics.map(toDiagnostics);
-    const model = editor.getModel(resource);
-    // Return value from getModel can be null if model not found
-    // (e.g. if user navigates away from editor)
-    if (model && model.getModeId() === languageId) {
-      editor.setModelMarkers(model, languageId, markers);
-    }
-  };
-
-  const onModelAdd = (model: editor.IModel): void => {
-    const modeId = model.getModeId();
-    if (modeId !== languageId) {
-      return;
-    }
-
-    let handle: ReturnType<typeof setTimeout>;
-    listeners.set(
-      String(model.uri),
-      model.onDidChangeContent(() => {
-        clearTimeout(handle);
-        handle = setTimeout(() => doValidate(model.uri, modeId), 500);
-      }),
-    );
-
-    doValidate(model.uri, modeId);
-  };
-
-  const onModelRemoved = (model: editor.IModel): void => {
-    editor.setModelMarkers(model, languageId, []);
-    const uriStr = String(model.uri);
-    const listener = listeners.get(uriStr);
-    if (listener) {
-      listener.dispose();
-      listeners.delete(uriStr);
-    }
-  };
-
-  editor.onDidCreateModel(onModelAdd);
-  editor.onWillDisposeModel((model) => {
-    onModelRemoved(model);
-    resetSchema(model.uri);
-  });
-  editor.onDidChangeModelLanguage((event) => {
-    onModelRemoved(event.model);
-    onModelAdd(event.model);
-    resetSchema(event.model.uri);
-  });
-  defaults.onDidChange(() => {
-    for (const model of editor.getModels()) {
-      if (model.getModeId() === languageId) {
-        onModelRemoved(model);
-        onModelAdd(model);
-      }
-    }
-  });
-
-  for (const model of editor.getModels()) {
-    onModelAdd(model);
-  }
 }
 
 // --- completion ------
 
 function fromPosition(position: Position): ls.Position {
   if (!position) {
-    return;
+    return void 0;
   }
   return { character: position.column - 1, line: position.lineNumber - 1 };
 }
 
+function fromRange(range: IRange): ls.Range {
+  if (!range) {
+    return void 0;
+  }
+  return {
+    start: {
+      line: range.startLineNumber - 1,
+      character: range.startColumn - 1,
+    },
+    end: { line: range.endLineNumber - 1, character: range.endColumn - 1 },
+  };
+}
 function toRange(range: ls.Range): Range {
   if (!range) {
-    return;
+    return void 0;
   }
   return new Range(
     range.start.line + 1,
     range.start.character + 1,
     range.end.line + 1,
-    range.end.character + 1,
+    range.end.character + 1
   );
 }
 
-function toCompletionItemKind(kind: languages.CompletionItemKind): languages.CompletionItemKind {
-  const mItemKind = languages.CompletionItemKind;
+function toCompletionItemKind(
+  kind: number
+): monaco.languages.CompletionItemKind {
+  const mItemKind = monaco.languages.CompletionItemKind;
 
   switch (kind) {
     case ls.CompletionItemKind.Text:
@@ -182,14 +231,59 @@ function toCompletionItemKind(kind: languages.CompletionItemKind): languages.Com
       return mItemKind.File;
     case ls.CompletionItemKind.Reference:
       return mItemKind.Reference;
-    default:
-      return mItemKind.Property;
   }
+  return mItemKind.Property;
 }
 
-function toTextEdit(textEdit: ls.TextEdit): editor.ISingleEditOperation {
+function fromCompletionItemKind(
+  kind: monaco.languages.CompletionItemKind
+): ls.CompletionItemKind {
+  const mItemKind = monaco.languages.CompletionItemKind;
+
+  switch (kind) {
+    case mItemKind.Text:
+      return ls.CompletionItemKind.Text;
+    case mItemKind.Method:
+      return ls.CompletionItemKind.Method;
+    case mItemKind.Function:
+      return ls.CompletionItemKind.Function;
+    case mItemKind.Constructor:
+      return ls.CompletionItemKind.Constructor;
+    case mItemKind.Field:
+      return ls.CompletionItemKind.Field;
+    case mItemKind.Variable:
+      return ls.CompletionItemKind.Variable;
+    case mItemKind.Class:
+      return ls.CompletionItemKind.Class;
+    case mItemKind.Interface:
+      return ls.CompletionItemKind.Interface;
+    case mItemKind.Module:
+      return ls.CompletionItemKind.Module;
+    case mItemKind.Property:
+      return ls.CompletionItemKind.Property;
+    case mItemKind.Unit:
+      return ls.CompletionItemKind.Unit;
+    case mItemKind.Value:
+      return ls.CompletionItemKind.Value;
+    case mItemKind.Enum:
+      return ls.CompletionItemKind.Enum;
+    case mItemKind.Keyword:
+      return ls.CompletionItemKind.Keyword;
+    case mItemKind.Snippet:
+      return ls.CompletionItemKind.Snippet;
+    case mItemKind.Color:
+      return ls.CompletionItemKind.Color;
+    case mItemKind.File:
+      return ls.CompletionItemKind.File;
+    case mItemKind.Reference:
+      return ls.CompletionItemKind.Reference;
+  }
+  return ls.CompletionItemKind.Property;
+}
+
+function toTextEdit(textEdit: ls.TextEdit): monaco.editor.ISingleEditOperation {
   if (!textEdit) {
-    return;
+    return void 0;
   }
   return {
     range: toRange(textEdit.range),
@@ -197,68 +291,87 @@ function toTextEdit(textEdit: ls.TextEdit): editor.ISingleEditOperation {
   };
 }
 
-export function createCompletionItemProvider(
-  getWorker: WorkerAccessor,
-): languages.CompletionItemProvider {
-  return {
-    triggerCharacters: [' ', ':'],
+export class CompletionAdapter
+  implements monaco.languages.CompletionItemProvider {
+  constructor(private _worker: WorkerAccessor) {}
 
-    async provideCompletionItems(model, position) {
-      const resource = model.uri;
+  public get triggerCharacters(): string[] {
+    return [' ', ':'];
+  }
 
-      const worker = await getWorker(resource);
-      const info = await worker.doComplete(String(resource), fromPosition(position));
-      if (!info) {
-        return;
-      }
+  public provideCompletionItems(
+    model: monaco.editor.IReadOnlyModel,
+    position: Position,
+    context: monaco.languages.CompletionContext,
+    token: CancellationToken
+  ): Thenable<monaco.languages.CompletionList> {
+    const resource = model.uri;
 
-      const wordInfo = model.getWordUntilPosition(position);
-      const wordRange = new Range(
-        position.lineNumber,
-        wordInfo.startColumn,
-        position.lineNumber,
-        wordInfo.endColumn,
-      );
+    return this._worker(resource)
+      .then((worker) => {
+        return worker.doComplete(resource.toString(), fromPosition(position));
+      })
+      .then((info) => {
+        if (!info) {
+          return;
+        }
 
-      const items = info.items.map((entry) => {
-        const item: languages.CompletionItem = {
-          label: entry.label,
-          insertText: entry.insertText || entry.label,
-          sortText: entry.sortText,
-          filterText: entry.filterText,
-          documentation: entry.documentation,
-          detail: entry.detail,
-          kind: toCompletionItemKind(entry.kind),
-          range: wordRange,
+        const wordInfo = model.getWordUntilPosition(position);
+        const wordRange = new Range(
+          position.lineNumber,
+          wordInfo.startColumn,
+          position.lineNumber,
+          wordInfo.endColumn
+        );
+
+        const items: monaco.languages.CompletionItem[] = info.items.map(
+          (entry) => {
+            const item: monaco.languages.CompletionItem = {
+              label: entry.label,
+              insertText: entry.insertText || entry.label,
+              sortText: entry.sortText,
+              filterText: entry.filterText,
+              documentation: entry.documentation,
+              detail: entry.detail,
+              kind: toCompletionItemKind(entry.kind),
+              range: wordRange,
+            };
+            if (entry.textEdit) {
+              item.range = toRange(entry.textEdit.range);
+              item.insertText = entry.textEdit.newText;
+            }
+            if (entry.additionalTextEdits) {
+              item.additionalTextEdits = entry.additionalTextEdits.map(
+                toTextEdit
+              );
+            }
+            if (entry.insertTextFormat === ls.InsertTextFormat.Snippet) {
+              item.insertTextRules =
+                monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet;
+            }
+            return item;
+          }
+        );
+
+        return {
+          isIncomplete: info.isIncomplete,
+          suggestions: items,
         };
-        if (entry.textEdit) {
-          item.range = toRange(
-            'range' in entry.textEdit ? entry.textEdit.range : entry.textEdit.replace,
-          );
-          item.insertText = entry.textEdit.newText;
-        }
-        if (entry.additionalTextEdits) {
-          item.additionalTextEdits = entry.additionalTextEdits.map(toTextEdit);
-        }
-        if (entry.insertTextFormat === ls.InsertTextFormat.Snippet) {
-          item.insertTextRules = languages.CompletionItemInsertTextRule.InsertAsSnippet;
-        }
-        return item;
       });
-
-      return {
-        incomplete: info.isIncomplete,
-        suggestions: items,
-      };
-    },
-  };
+  }
 }
 
-function isMarkupContent(thing: unknown): thing is ls.MarkupContent {
-  return thing && typeof thing === 'object' && typeof (thing as ls.MarkupContent).kind === 'string';
+function isMarkupContent(thing: any): thing is ls.MarkupContent {
+  return (
+    thing &&
+    typeof thing === 'object' &&
+    typeof (thing as ls.MarkupContent).kind === 'string'
+  );
 }
 
-function toMarkdownString(entry: ls.MarkedString | ls.MarkupContent): IMarkdownString {
+function toMarkdownString(
+  entry: ls.MarkupContent | ls.MarkedString
+): monaco.IMarkdownString {
   if (typeof entry === 'string') {
     return {
       value: entry,
@@ -267,7 +380,7 @@ function toMarkdownString(entry: ls.MarkedString | ls.MarkupContent): IMarkdownS
   if (isMarkupContent(entry)) {
     if (entry.kind === 'plaintext') {
       return {
-        value: entry.value.replace(/[!#()*+.[\\\]_`{}-]/g, '\\$&'),
+        value: entry.value.replace(/[\\`*_{}[\]()#+\-.!]/g, '\\$&'),
       };
     }
     return {
@@ -275,14 +388,14 @@ function toMarkdownString(entry: ls.MarkedString | ls.MarkupContent): IMarkdownS
     };
   }
 
-  return { value: `\`\`\`${entry.language}\n${entry.value}\n\`\`\`\n` };
+  return { value: '```' + entry.language + '\n' + entry.value + '\n```\n' };
 }
 
 function toMarkedStringArray(
-  contents: ls.MarkedString | ls.MarkedString[] | ls.MarkupContent,
-): IMarkdownString[] {
+  contents: ls.MarkupContent | ls.MarkedString | ls.MarkedString[]
+): monaco.IMarkdownString[] {
   if (!contents) {
-    return;
+    return void 0;
   }
   if (Array.isArray(contents)) {
     return contents.map(toMarkdownString);
@@ -292,28 +405,36 @@ function toMarkedStringArray(
 
 // --- hover ------
 
-export function createHoverProvider(getWorker: WorkerAccessor): languages.HoverProvider {
-  return {
-    async provideHover(model, position) {
-      const resource = model.uri;
+export class HoverAdapter implements monaco.languages.HoverProvider {
+  constructor(private _worker: WorkerAccessor) {}
 
-      const worker = await getWorker(resource);
-      const info = await worker.doHover(String(resource), fromPosition(position));
-      if (!info) {
-        return;
-      }
-      return {
-        range: toRange(info.range),
-        contents: toMarkedStringArray(info.contents),
-      };
-    },
-  };
+  public provideHover(
+    model: monaco.editor.IReadOnlyModel,
+    position: Position,
+    token: CancellationToken
+  ): Thenable<monaco.languages.Hover> {
+    const resource = model.uri;
+
+    return this._worker(resource)
+      .then((worker) => {
+        return worker.doHover(resource.toString(), fromPosition(position));
+      })
+      .then((info) => {
+        if (!info) {
+          return;
+        }
+        return {
+          range: toRange(info.range),
+          contents: toMarkedStringArray(info.contents),
+        } as monaco.languages.Hover;
+      });
+  }
 }
 
 // --- document symbols ------
 
-function toSymbolKind(kind: ls.SymbolKind): languages.SymbolKind {
-  const mKind = languages.SymbolKind;
+function toSymbolKind(kind: ls.SymbolKind): monaco.languages.SymbolKind {
+  const mKind = monaco.languages.SymbolKind;
 
   switch (kind) {
     case ls.SymbolKind.File:
@@ -352,43 +473,48 @@ function toSymbolKind(kind: ls.SymbolKind): languages.SymbolKind {
       return mKind.Boolean;
     case ls.SymbolKind.Array:
       return mKind.Array;
-    default:
-      return mKind.Function;
+  }
+  return mKind.Function;
+}
+
+export class DocumentSymbolAdapter
+  implements monaco.languages.DocumentSymbolProvider {
+  constructor(private _worker: WorkerAccessor) {}
+
+  public provideDocumentSymbols(
+    model: monaco.editor.IReadOnlyModel,
+    token: CancellationToken
+  ): Thenable<monaco.languages.DocumentSymbol[]> {
+    const resource = model.uri;
+
+    return this._worker(resource)
+      .then((worker) => worker.findDocumentSymbols(resource.toString()))
+      .then((items) => {
+        if (!items) {
+          return;
+        }
+        return items.map((item) => toDocumentSymbol(item));
+      });
   }
 }
 
-function toDocumentSymbol(item: ls.DocumentSymbol): languages.DocumentSymbol {
+function toDocumentSymbol(
+  item: ls.DocumentSymbol
+): monaco.languages.DocumentSymbol {
   return {
     detail: '',
     range: toRange(item.range),
     name: item.name,
     kind: toSymbolKind(item.kind),
     selectionRange: toRange(item.selectionRange),
-    children: item.children.map(toDocumentSymbol),
+    children: item.children.map((child) => toDocumentSymbol(child)),
     tags: [],
   };
 }
 
-export function createDocumentSymbolProvider(
-  getWorker: WorkerAccessor,
-): languages.DocumentSymbolProvider {
-  return {
-    async provideDocumentSymbols(model) {
-      const resource = model.uri;
-
-      const worker = await getWorker(resource);
-      const items = await worker.findDocumentSymbols(String(resource));
-      if (!items) {
-        return;
-      }
-      return items.map(toDocumentSymbol);
-    },
-  };
-}
-
 function fromFormattingOptions(
-  options: languages.FormattingOptions,
-): CustomFormatterOptions & ls.FormattingOptions {
+  options: monaco.languages.FormattingOptions
+): ls.FormattingOptions & CustomFormatterOptions {
   return {
     tabSize: options.tabSize,
     insertSpaces: options.insertSpaces,
@@ -396,42 +522,115 @@ function fromFormattingOptions(
   };
 }
 
-export function createDocumentFormattingEditProvider(
-  getWorker: WorkerAccessor,
-): languages.DocumentFormattingEditProvider {
-  return {
-    async provideDocumentFormattingEdits(model, options) {
-      const resource = model.uri;
+export class DocumentFormattingEditProvider
+  implements monaco.languages.DocumentFormattingEditProvider {
+  constructor(private _worker: WorkerAccessor) {}
 
-      const worker = await getWorker(resource);
-      const edits = await worker.format(String(resource), fromFormattingOptions(options));
-      if (!edits || edits.length === 0) {
-        return;
-      }
-      return edits.map(toTextEdit);
-    },
-  };
+  public provideDocumentFormattingEdits(
+    model: monaco.editor.IReadOnlyModel,
+    options: monaco.languages.FormattingOptions,
+    token: CancellationToken
+  ): Thenable<monaco.editor.ISingleEditOperation[]> {
+    const resource = model.uri;
+
+    return this._worker(resource).then((worker) => {
+      return worker
+        .format(resource.toString(), null, fromFormattingOptions(options))
+        .then((edits) => {
+          if (!edits || edits.length === 0) {
+            return;
+          }
+          return edits.map(toTextEdit);
+        });
+    });
+  }
 }
 
-function toLink(link: ls.DocumentLink): languages.ILink {
-  return {
-    range: toRange(link.range),
-    tooltip: link.tooltip,
-    url: link.target,
-  };
+export class DocumentRangeFormattingEditProvider
+  implements monaco.languages.DocumentRangeFormattingEditProvider {
+  constructor(private _worker: WorkerAccessor) {}
+
+  public provideDocumentRangeFormattingEdits(
+    model: monaco.editor.IReadOnlyModel,
+    range: Range,
+    options: monaco.languages.FormattingOptions,
+    token: CancellationToken
+  ): Thenable<monaco.editor.ISingleEditOperation[]> {
+    const resource = model.uri;
+
+    return this._worker(resource).then((worker) => {
+      return worker
+        .format(
+          resource.toString(),
+          fromRange(range),
+          fromFormattingOptions(options)
+        )
+        .then((edits) => {
+          if (!edits || edits.length === 0) {
+            return;
+          }
+          return edits.map(toTextEdit);
+        });
+    });
+  }
 }
 
-export function createLinkProvider(getWorker: WorkerAccessor): languages.LinkProvider {
-  return {
-    async provideLinks(model) {
-      const resource = model.uri;
+// export class DocumentColorAdapter
+// implements monaco.languages.DocumentColorProvider {
+// constructor(private _worker: WorkerAccessor) {}
 
-      const worker = await getWorker(resource);
-      const links = await worker.findLinks(String(resource));
+// public provideDocumentColors(
+// model: monaco.editor.IReadOnlyModel,
+// token: CancellationToken
+// ): Thenable<monaco.languages.IColorInformation[]> {
+// const resource = model.uri;
 
-      return {
-        links: links.map(toLink),
-      };
-    },
-  };
-}
+// return this._worker(resource)
+// .then(worker => worker.findDocumentColors(resource.toString()))
+// .then(infos => {
+// if (!infos) {
+// return;
+// }
+// return infos.map(item => ({
+// color: item.color,
+// range: toRange(item.range),
+// }));
+// });
+// }
+
+// public provideColorPresentations(
+// model: monaco.editor.IReadOnlyModel,
+// info: monaco.languages.IColorInformation,
+// token: CancellationToken
+// ): Thenable<monaco.languages.IColorPresentation[]> {
+// const resource = model.uri;
+
+// return this._worker(resource)
+// .then(worker =>
+// worker.getColorPresentations(
+// resource.toString(),
+// info.color,
+// fromRange(info.range)
+// )
+// )
+// .then(presentations => {
+// if (!presentations) {
+// return;
+// }
+// return presentations.map(presentation => {
+// const item: monaco.languages.IColorPresentation = {
+// label: presentation.label,
+// };
+// if (presentation.textEdit) {
+// item.textEdit = toTextEdit(presentation.textEdit);
+// }
+// if (presentation.additionalTextEdits) {
+// item.additionalTextEdits = presentation.additionalTextEdits.map(
+// toTextEdit
+// );
+// }
+// return item;
+// });
+// });
+// }
+// }

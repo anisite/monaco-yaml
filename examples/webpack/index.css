@@ -1,0 +1,44 @@
+html {
+  height: 100%;
+  margin: 0px;
+  padding: 0px;
+  width: 100%;
+  position: fixed;
+}
+
+body {
+  margin: 0px;
+  padding: 0px;
+  height: 100%;
+  width: 100%;
+  display: flex;
+  overflow: hidden;
+  position: fixed;
+}
+
+#editor {
+  width: 800px;
+  min-height: 100%;
+  height: 100%;
+  float: left;
+}
+
+#formContainer {
+  width: auto;
+  height: 100%;
+  margin-left: 800px;
+}
+
+#formIframe {
+  width: 100%;
+  height: 100%;
+  border: 0px;
+}
+
+.container {
+  width: 100%;
+}
+
+.flex-item {
+  width: 100%;
+}
